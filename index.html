@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Captain's Wallpaper</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html,body{margin:0;height:100%;background:#04070d;overflow:hidden;cursor:none}
+  canvas{display:block;width:100vw;height:100vh}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+  /* ---------- settings you can change ---------- */
+  const FPS = 30;                       // lower = less battery
+  const LAT = 28.33, LON = -82.28;      // San Antonio, FL. Change to your exact spot.
+  const UNITS = 'fahrenheit';           // or 'celsius'
+  const REFRESH_MIN = 15;               // how often to re-check the weather
+  const FORCE = null;                   // preview a look: 'clear' 'partly' 'overcast' 'fog' 'drizzle' 'rain' 'storm'
+  const FORCE_HOUR = null;              // preview time of day, 0-23 (e.g. 14 = afternoon, 23 = night)
+  /* --------------------------------------------- */
+
+  const cv = document.getElementById('c');
+  const ctx = cv.getContext('2d');
+  const BRASS = '232,201,138';
+  const SERIF = '"Baskerville","Hoefler Text","Palatino","Georgia",serif';
+  const MONO = 'Menlo,"SF Mono","Courier New",monospace';
+  const CODE = '01{}[]<>/\\;:=+-*#$%&|ABCDEF0123456789';
+  const TAU = Math.PI * 2;
+  let W, H, dpr, S, rain, clouds, strips, cell;
+  let prev = 0, nextFlash = 5, flashAt = -99, bolt = [], wph = 0;
+  let clockKey = '', clockTime = '', clockDate = '';
+  const now = () => { const d = new Date(); if (FORCE_HOUR !== null) d.setHours(FORCE_HOUR); return d; };
+  let ast = null, cloudPh = 0, dxs = -.5, stars = [], streaks = [];
+  let wx = null;                        // { temp, label, wind, dir } once weather loads
+  let haveWind = false;
+  const WU = UNITS === 'celsius' ? 'km/h' : 'mph';
+
+  // ---------- weather model ----------
+  // R = sea roughness, rain 0-1, thunder 0/1, cloud 0-1, gray 0-1 (how dull the sky is), fog 0-1
+  const PRESETS = {
+    clear:    { label: 'Clear',          R: .85, rain: 0,   thunder: 0, cloud: .12, gray: 0,   fog: 0 },
+    mostly:   { label: 'Mostly clear',   R: .90, rain: 0,   thunder: 0, cloud: .25, gray: .05, fog: 0 },
+    partly:   { label: 'Partly cloudy',  R: .95, rain: 0,   thunder: 0, cloud: .50, gray: .20, fog: 0 },
+    overcast: { label: 'Overcast',       R: 1.05,rain: 0,   thunder: 0, cloud: .85, gray: .60, fog: 0 },
+    fog:      { label: 'Fog',            R: .90, rain: 0,   thunder: 0, cloud: .60, gray: .50, fog: .6 },
+    drizzle:  { label: 'Drizzle',        R: 1.25,rain: .30, thunder: 0, cloud: .90, gray: .70, fog: 0 },
+    lrain:    { label: 'Light rain',     R: 1.35,rain: .45, thunder: 0, cloud: .95, gray: .80, fog: 0 },
+    rain:     { label: 'Rain',           R: 1.70,rain: .75, thunder: 0, cloud: 1,   gray: .90, fog: 0 },
+    hrain:    { label: 'Heavy rain',     R: 2.00,rain: 1,   thunder: 0, cloud: 1,   gray: 1,   fog: 0 },
+    showers:  { label: 'Showers',        R: 1.50,rain: .60, thunder: 0, cloud: .95, gray: .85, fog: 0 },
+    snow:     { label: 'Snow',           R: 1.20,rain: .35, thunder: 0, cloud: .90, gray: .80, fog: 0 },
+    storm:    { label: 'Thunderstorm',   R: 2.20,rain: 1,   thunder: 1, cloud: 1,   gray: 1,   fog: 0 },
+  };
+  const FORCE_CODE = { clear: 0, partly: 2, overcast: 3, fog: 45, drizzle: 51, rain: 63, storm: 95 };
+  function classify(c) {
+    if (c === 0) return PRESETS.clear;
+    if (c === 1) return PRESETS.mostly;
+    if (c === 2) return PRESETS.partly;
+    if (c === 3) return PRESETS.overcast;
+    if (c === 45 || c === 48) return PRESETS.fog;
+    if (c >= 51 && c <= 55) return PRESETS.drizzle;
+    if (c === 56 || c === 57 || c === 66 || c === 67) return PRESETS.rain;
+    if (c === 61) return PRESETS.lrain;
+    if (c === 63) return PRESETS.rain;
+    if (c === 65) return PRESETS.hrain;
+    if (c === 80) return PRESETS.showers;
+    if (c === 81) return PRESETS.rain;
+    if (c === 82) return PRESETS.hrain;
+    if ((c >= 71 && c <= 77) || c === 85 || c === 86) return PRESETS.snow;
+    if (c >= 95) return PRESETS.storm;
+    return PRESETS.partly;
+  }
+  const hr = new Date().getHours();
+  const cur = { ...PRESETS.clear, day: hr >= 6 && hr < 19 ? 1 : 0, wd: 0, Rn: .85, breeze: .3 };
+  const tgt = { ...cur };
+
+  function applyWeather(code, isDay, temp, wind, dir) {
+    const p = classify(code), mph = WU === 'km/h' ? (wind || 0) / 1.609 : (wind || 0);
+    Object.assign(tgt, p, { R: p.R + Math.min(mph, 30) / 30 * .3 });
+    if (dir != null) { if (!haveWind) cur.wd = dir; tgt.wd = dir; haveWind = true; }
+    wx = { temp, label: p.label, wind, dir };
+  }
+  const NAMES = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
+  const compassName = d => NAMES[Math.round(d / 22.5) % 16];
+  async function loadWeather() {
+    if (FORCE) { applyWeather(FORCE_CODE[FORCE] ?? 2, tgt.day, 78, 8, 225); return; }
+    try {
+      const u = `https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}` +
+        `&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m,is_day&temperature_unit=${UNITS}&wind_speed_unit=${WU === 'km/h' ? 'kmh' : 'mph'}`;
+      const j = await (await fetch(u)).json(), c = j.current;
+      applyWeather(c.weather_code, c.is_day, c.temperature_2m, c.wind_speed_10m, c.wind_direction_10m);
+    } catch (e) { /* offline: keep last look */ }
+  }
+  function ease(dt) {
+    const f = Math.min(1, dt * .7);
+    for (const k of ['R','rain','thunder','cloud','gray','fog']) cur[k] += (tgt[k] - cur[k]) * f;
+    const dd = ((tgt.wd - cur.wd + 540) % 360) - 180; cur.wd = (cur.wd + dd * f + 360) % 360; // turn the short way round
+  }
+
+  const mixc = (a, b, t) => [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t, a[2]+(b[2]-a[2])*t];
+  const rgb = c => `rgb(${Math.round(c[0])},${Math.round(c[1])},${Math.round(c[2])})`;
+
+  // ---- globe points (abstract land, built once) ----
+  const pts = [];
+  for (let la = -85; la <= 85; la += 5) {
+    for (let lo = 0; lo < 360; lo += 5) {
+      const lat = la * Math.PI / 180, lon = lo * Math.PI / 180;
+      const v = Math.sin(lon*2+1.3)*Math.cos(lat*1.6) + .6*Math.sin(lon*3.7+lat*2.1+.5) + .4*Math.sin(lon*6.1-lat*3.3);
+      pts.push({ lat, lon, land: v > .55 });
+    }
+  }
+
+  function build() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = cv.width = Math.round(innerWidth * dpr);
+    H = cv.height = Math.round(innerHeight * dpr);
+    S = H / 1000;
+    rain = Array.from({length: 300}, () => ({
+      x: Math.random()*W*1.3 - W*.15, y: Math.random()*H,
+      v: (700 + Math.random()*500) * S, l: (10 + Math.random()*14) * S
+    }));
+    clouds = Array.from({length: 8}, () => ({
+      x: Math.random()*W, y: (.03 + Math.random()*.4) * H,
+      r: (.18 + Math.random()*.2) * H, v: (6 + Math.random()*10) * S, a: .25 + Math.random()*.25
+    }));
+    stars = Array.from({length: 150}, () => ({ x: Math.random()*W, y: Math.random()*H*.62, s: (.8 + Math.random()*1.4) * S * dpr / 1.4,
+      a: .4 + Math.random()*.6, sp: .6 + Math.random()*1.8, ph: Math.random()*6.28 }));
+    streaks = Array.from({length: 46}, () => ({ x: Math.random()*W, y: (.08 + Math.random()*.66) * H,
+      l: (60 + Math.random()*150) * S, v: (60 + Math.random()*100) * S, a: .06 + Math.random()*.12 }));
+    cell = Math.max(12, Math.round(15 * S));
+    strips = [];
+    for (let j = 0; j < 18; j++) {
+      const c = document.createElement('canvas'); c.width = W; c.height = cell;
+      const g = c.getContext('2d');
+      g.font = `${cell * .8}px ${MONO}`; g.textBaseline = 'middle';
+      for (let x = 0; x < W; x += cell * .62) {
+        const ch = CODE[Math.floor(Math.random() * CODE.length)];
+        g.fillStyle = Math.random() < .12 ? 'rgba(190,245,255,1)' : `rgba(70,190,230,${.25 + Math.random()*.4})`;
+        g.fillText(ch, x, cell / 2);
+      }
+      strips.push(c);
+    }
+  }
+
+  // ---------- sky ----------
+  const smooth = x => { x = Math.max(0, Math.min(1, x)); return x * x * (3 - 2 * x); };
+  const cs = c => `${Math.round(c[0])},${Math.round(c[1])},${Math.round(c[2])}`;
+  function bodyXY(b) {   // east on the left, west on the right, higher in the sky = higher on screen
+    const azd = b.az * 180 / Math.PI;
+    return [W * Math.max(.05, Math.min(.95, .5 + (azd - 180) / 180 * .4)), H * (.70 - Math.max(-10, Math.min(75, b.alt)) / 70 * .62)];
+  }
+  function drawMoon(x, y, R, phi, a) {
+    const gl = ctx.createRadialGradient(x, y, 0, x, y, R * 6);
+    gl.addColorStop(0, `rgba(200,225,255,${.22 * a})`); gl.addColorStop(1, 'rgba(200,225,255,0)');
+    ctx.fillStyle = gl; ctx.fillRect(x - R*6, y - R*6, R*12, R*12);
+    ctx.save(); ctx.translate(x, y); ctx.globalAlpha = a;
+    ctx.fillStyle = 'rgba(48,64,86,.85)'; ctx.beginPath(); ctx.arc(0, 0, R, 0, TAU); ctx.fill();   // dark side
+    const waning = phi > Math.PI, p = waning ? TAU - phi : phi;
+    if (waning) ctx.scale(-1, 1);
+    ctx.fillStyle = 'rgb(236,242,250)'; ctx.beginPath();
+    ctx.arc(0, 0, R, -Math.PI/2, Math.PI/2, false);
+    const c = Math.cos(p), xr = Math.max(.01, Math.abs(c) * R);
+    if (c > 0) ctx.ellipse(0, 0, xr, R, 0, Math.PI/2, -Math.PI/2, true);
+    else ctx.ellipse(0, 0, xr, R, 0, Math.PI/2, Math.PI*1.5, false);
+    ctx.closePath(); ctx.fill(); ctx.restore();
+  }
+  function sky(t) {
+    const g = cur.gray, d = cur.day, sun = ast.sun, moon = ast.moon;
+    const tw = Math.max(0, 1 - Math.abs(sun.alt - 2) / 9) * (1 - g * .6);     // sunrise / sunset glow
+    const top = mixc(mixc([4,7,13],[3,5,9],g),    mixc([14,64,110],[40,52,64],g),   d);
+    let   mid = mixc(mixc([10,26,39],[8,16,24],g), mixc([40,120,170],[62,78,92],g),  d);
+    let   hor = mixc(mixc([22,57,75],[16,34,46],g),mixc([150,215,235],[98,116,128],g),d);
+    hor = mixc(hor, [238,128,78], tw * .65); mid = mixc(mid, [110,70,105], tw * .3);
+    const grad = ctx.createLinearGradient(0, 0, 0, H * .8);
+    grad.addColorStop(0, rgb(top)); grad.addColorStop(.55, rgb(mid)); grad.addColorStop(1, rgb(hor));
+    ctx.fillStyle = grad; ctx.fillRect(0, 0, W, H);
+
+    // stars on clear nights
+    const sa = (1 - d) * (1 - g);
+    if (sa > .02) for (const s of stars) {
+      ctx.fillStyle = `rgba(215,230,255,${sa * s.a * (.6 + .4 * Math.sin(t * s.sp + s.ph))})`;
+      ctx.fillRect(s.x, s.y, s.s, s.s);
+    }
+
+    // sun, at its real position for your location and time
+    const sunA = smooth((sun.alt + 4) / 10) * (1 - g);
+    if (sun.alt > -8 && sunA > .01) {
+      const [x, y] = bodyXY(sun), col = cs(mixc([255,150,80],[255,240,200], Math.min(1, Math.max(0, sun.alt / 20))));
+      const gl = ctx.createRadialGradient(x, y, 0, x, y, H * .34);
+      gl.addColorStop(0, `rgba(${col},${.8 * sunA})`); gl.addColorStop(.12, `rgba(${col},${.42 * sunA})`); gl.addColorStop(1, `rgba(${col},0)`);
+      ctx.fillStyle = gl; ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = `rgba(${col},${sunA})`; ctx.beginPath(); ctx.arc(x, y, H * .032, 0, TAU); ctx.fill();
+    }
+    // moon, with its real phase and position
+    const moonA = smooth((moon.alt + 2) / 8) * (1 - g * .6) * (1 - d * .85);
+    if (moonA > .02) { const [x, y] = bodyXY(moon); drawMoon(x, y, H * .03, ast.phi, moonA); }
+
+    const cc = mixc([26,44,62], mixc([245,248,252],[120,134,148],g), d);
+    for (const c of clouds) {
+      const M = W + 2*c.r, x = (((c.x + c.v * cloudPh) % M) + M) % M - c.r;
+      const a = Math.min(1, c.a * cur.cloud * (d ? 1.1 : 1.2));
+      const cg = ctx.createRadialGradient(x, c.y, 0, x, c.y, c.r);
+      cg.addColorStop(0, `rgba(${cs(cc)},${a})`); cg.addColorStop(1, `rgba(${cs(cc)},0)`);
+      ctx.fillStyle = cg; ctx.fillRect(x - c.r, c.y - c.r, c.r*2, c.r*2);
+    }
+  }
+
+  // ---------- lightning (thunderstorms only) ----------
+  function lightning(t) {
+    if (cur.thunder < .5) return;
+    if (t > nextFlash) {
+      flashAt = t; nextFlash = t + 5 + Math.random() * 9;
+      const side = Math.random() < .5 ? .08 + Math.random()*.2 : .72 + Math.random()*.2;
+      let x = W * side, y = 0; bolt = [[x, y]];
+      while (y < H * .62) { x += (Math.random() - .5) * 60 * S; y += (20 + Math.random()*35) * S; bolt.push([x, y]); }
+    }
+    const dt = t - flashAt; if (dt > 1.2) return;
+    let a = Math.exp(-dt * 7);
+    if (dt > .22) a += .6 * Math.exp(-(dt - .22) * 10);
+    ctx.fillStyle = `rgba(170,200,255,${Math.min(a, 1) * .2})`; ctx.fillRect(0, 0, W, H);
+    if (dt < .45) {
+      ctx.save(); ctx.strokeStyle = `rgba(235,245,255,${Math.min(a, 1)})`; ctx.lineWidth = 2.5 * S;
+      ctx.shadowColor = 'rgba(170,200,255,1)'; ctx.shadowBlur = 24 * S;
+      ctx.beginPath(); bolt.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  // ---------- breeze: drifting wind streaks (stronger at night and in wind) ----------
+  function windFx(dt) {
+    const k = Math.min(1, Math.max(0, (cur.breeze - .05) / .4));
+    if (k < .02) return;
+    ctx.lineCap = 'round'; ctx.lineWidth = 1.5 * S; ctx.strokeStyle = 'rgb(225,240,250)';
+    const sign = dxs >= 0 ? 1 : -1;
+    for (const w of streaks) {
+      w.x += dxs * w.v * (.3 + 2.2 * cur.breeze) * dt;
+      if (w.x > W + w.l) w.x = -w.l; else if (w.x < -w.l) w.x = W + w.l;
+      ctx.globalAlpha = w.a * k;
+      ctx.beginPath(); ctx.moveTo(w.x, w.y); ctx.lineTo(w.x - sign * w.l, w.y + w.l * .02); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- rain ----------
+  function rainFx(dt) {
+    const n = Math.floor(rain.length * cur.rain);
+    if (n < 1) return;
+    const sl = dxs * (.12 + .45 * cur.breeze);                       // wind slants the rain
+    ctx.strokeStyle = cur.day > .5 ? `rgba(215,230,245,${.10 + .14*cur.rain})` : `rgba(190,215,235,${.10 + .12*cur.rain})`;
+    ctx.lineWidth = 1 * dpr; ctx.beginPath();
+    for (let i = 0; i < rain.length; i++) {
+      const r = rain[i];
+      r.y += r.v * dt; r.x += r.v * sl * dt;
+      if (r.y > H) { r.y = -r.l; r.x = Math.random() * W * 1.3 - W * .15; }
+      if (r.x < -W * .15) r.x += W * 1.3; else if (r.x > W * 1.15) r.x -= W * 1.3;
+      if (i >= n) continue;
+      ctx.moveTo(r.x, r.y); ctx.lineTo(r.x - sl * r.l, r.y - r.l);
+    }
+    ctx.stroke();
+  }
+
+  // ---------- compass + globe ----------
+  function star(cx, cy, r) {
+    for (let k = 0; k < 8; k++) {
+      const a = k * Math.PI / 4, long = k % 2 === 0;
+      const len = r * (long ? 1.62 : 1.3), wid = r * (long ? .13 : .08);
+      const dx = Math.sin(a), dy = -Math.cos(a), px = -dy, py = dx;
+      const tip = [cx + dx*len, cy + dy*len];
+      const M = [cx + dx*r*.7, cy + dy*r*.7];
+      const B1 = [M[0] + px*wid, M[1] + py*wid], B2 = [M[0] - px*wid, M[1] - py*wid];
+      ctx.fillStyle = `rgba(${BRASS},${long ? .6 : .38})`;
+      ctx.beginPath(); ctx.moveTo(...tip); ctx.lineTo(...B1); ctx.lineTo(...M); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = `rgba(${BRASS},${long ? .28 : .16})`;
+      ctx.beginPath(); ctx.moveTo(...tip); ctx.lineTo(...M); ctx.lineTo(...B2); ctx.closePath(); ctx.fill();
+    }
+  }
+
+  function bezel(cx, cy, r, t) {
+    ctx.strokeStyle = `rgba(${BRASS},.55)`; ctx.lineWidth = 1.5 * S;
+    ctx.beginPath(); ctx.arc(cx, cy, r*1.36, 0, TAU); ctx.stroke();
+    ctx.beginPath(); ctx.arc(cx, cy, r*1.5, 0, TAU); ctx.stroke();
+    const rot = t * .04;
+    for (let i = 0; i < 72; i++) {
+      const a = rot + i * TAU / 72, big = i % 9 === 0, mid = i % 3 === 0;
+      const l = r * (big ? .14 : mid ? .09 : .05);
+      ctx.strokeStyle = `rgba(${BRASS},${big ? .85 : .5})`; ctx.lineWidth = (big ? 2 : 1) * S;
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.sin(a)*r*1.5, cy - Math.cos(a)*r*1.5);
+      ctx.lineTo(cx + Math.sin(a)*(r*1.5 - l), cy - Math.cos(a)*(r*1.5 - l));
+      ctx.stroke();
+    }
+    ctx.save(); ctx.setLineDash([2*S, 10*S]); ctx.lineDashOffset = -t * 6;
+    ctx.strokeStyle = `rgba(${BRASS},.35)`; ctx.beginPath(); ctx.arc(cx, cy, r*1.2, 0, TAU); ctx.stroke(); ctx.restore();
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    [['N',0],['E',90],['S',180],['W',270]].forEach(([c, d]) => {
+      const a = d * Math.PI / 180;
+      ctx.font = `bold ${r*.2}px ${SERIF}`;
+      ctx.fillStyle = c === 'N' ? 'rgba(235,110,95,.95)' : `rgba(${BRASS},.95)`;
+      ctx.fillText(c, cx + Math.sin(a)*r*1.74, cy - Math.cos(a)*r*1.74);
+    });
+    ctx.font = `${r*.1}px ${SERIF}`; ctx.fillStyle = `rgba(${BRASS},.6)`;
+    [['NE',45],['SE',135],['SW',225],['NW',315]].forEach(([c, d]) => {
+      const a = d * Math.PI / 180;
+      ctx.fillText(c, cx + Math.sin(a)*r*1.66, cy - Math.cos(a)*r*1.66);
+    });
+  }
+
+  function globe(cx, cy, r, t) {
+    const lon0 = t * .22, tilt = .41, ct = Math.cos(tilt), st = Math.sin(tilt);
+    const proj = (lat, lon) => {
+      const l = lon + lon0, X = Math.cos(lat)*Math.sin(l), Y = Math.sin(lat), Z = Math.cos(lat)*Math.cos(l);
+      return [cx + X*r, cy - (Y*ct - Z*st)*r, Y*st + Z*ct];
+    };
+    const bg = ctx.createRadialGradient(cx - r*.35, cy - r*.35, r*.1, cx, cy, r);
+    bg.addColorStop(0, 'rgba(18,58,76,.96)'); bg.addColorStop(1, 'rgba(4,14,24,.97)');
+    ctx.fillStyle = bg; ctx.beginPath(); ctx.arc(cx, cy, r, 0, TAU); ctx.fill();
+
+    const front = new Path2D(), back = new Path2D();
+    const seg = (a, b) => { const p = (a[2] + b[2]) > 0 ? front : back; p.moveTo(a[0], a[1]); p.lineTo(b[0], b[1]); };
+    for (let lo = 0; lo < 360; lo += 30) {
+      let last = null;
+      for (let la = -90; la <= 90; la += 3) {
+        const p = proj(la * Math.PI/180, lo * Math.PI/180); if (last) seg(last, p); last = p;
+      }
+    }
+    for (let la = -60; la <= 60; la += 30) {
+      let last = null;
+      for (let lo = 0; lo <= 360; lo += 4) {
+        const p = proj(la * Math.PI/180, lo * Math.PI/180); if (last) seg(last, p); last = p;
+      }
+    }
+    ctx.lineWidth = 1 * S;
+    ctx.strokeStyle = 'rgba(120,200,220,.10)'; ctx.stroke(back);
+    ctx.strokeStyle = 'rgba(140,220,240,.30)'; ctx.stroke(front);
+
+    for (const d of pts) {
+      const p = proj(d.lat, d.lon); if (p[2] <= 0) continue;
+      ctx.fillStyle = d.land ? `rgba(${BRASS},${.35 + p[2]*.6})` : `rgba(120,210,235,${.08 + p[2]*.12})`;
+      ctx.beginPath(); ctx.arc(p[0], p[1], (d.land ? 1.9 : 1.1) * S * (.6 + p[2]*.4), 0, TAU); ctx.fill();
+    }
+
+    ctx.save(); ctx.strokeStyle = `rgba(${BRASS},.6)`; ctx.lineWidth = 2 * S;
+    ctx.shadowColor = `rgba(${BRASS},.8)`; ctx.shadowBlur = 22 * S;
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, TAU); ctx.stroke(); ctx.restore();
+  }
+
+  // needle = live wind vane: points to where the wind is coming from
+  function needle(cx, cy, r, t) {
+    const sway = .015 + Math.min(wx ? wx.wind : 0, 30) * .0025;
+    const a = haveWind
+      ? cur.wd * Math.PI / 180 + sway * Math.sin(t * 1.7) + sway * .6 * Math.sin(t * 3.1 + 1)
+      : (.07 + .05 * cur.R) * Math.sin(t * .9) + .06 * Math.sin(t * 2.3 + 1);
+    ctx.save(); ctx.translate(cx, cy); ctx.rotate(a);
+    ctx.fillStyle = 'rgba(220,75,62,.85)';
+    ctx.beginPath(); ctx.moveTo(0, -r*1.4); ctx.lineTo(-r*.045, 0); ctx.lineTo(r*.045, 0); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = `rgba(${BRASS},.65)`;
+    ctx.beginPath(); ctx.moveTo(0, r*1.4); ctx.lineTo(-r*.045, 0); ctx.lineTo(r*.045, 0); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = `rgba(${BRASS},1)`; ctx.beginPath(); ctx.arc(0, 0, r*.04, 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+
+  // sun + moon position (low-precision astronomy, good to about a degree)
+  function astro(date) {
+    const rad = Math.PI / 180, JD = date.getTime() / 86400000 + 2440587.5, n = JD - 2451545;
+    const eps = (23.439 - 4e-7 * n) * rad;
+    const Ls = (280.460 + .9856474 * n) % 360, gs = ((357.528 + .9856003 * n) % 360) * rad;
+    const lamS = (Ls + 1.915 * Math.sin(gs) + .020 * Math.sin(2 * gs)) * rad;
+    const raS = Math.atan2(Math.cos(eps) * Math.sin(lamS), Math.cos(lamS)), decS = Math.asin(Math.sin(eps) * Math.sin(lamS));
+    const Lm = (218.316 + 13.176396 * n) % 360, Mm = ((134.963 + 13.064993 * n) % 360) * rad, Fm = ((93.272 + 13.229350 * n) % 360) * rad;
+    const lamM = (Lm + 6.289 * Math.sin(Mm)) * rad, betM = 5.128 * Math.sin(Fm) * rad;
+    const raM = Math.atan2(Math.sin(lamM) * Math.cos(eps) - Math.tan(betM) * Math.sin(eps), Math.cos(lamM));
+    const decM = Math.asin(Math.sin(betM) * Math.cos(eps) + Math.cos(betM) * Math.sin(eps) * Math.sin(lamM));
+    const lst = ((280.46061837 + 360.98564736629 * n + LON) % 360) * rad, phi = LAT * rad;
+    const hz = (ra, dec) => {
+      const Hh = lst - ra;
+      const alt = Math.asin(Math.sin(phi) * Math.sin(dec) + Math.cos(phi) * Math.cos(dec) * Math.cos(Hh));
+      const az = Math.atan2(Math.sin(Hh), Math.cos(Hh) * Math.sin(phi) - Math.tan(dec) * Math.cos(phi)) + Math.PI;
+      return { alt: alt / rad, az };
+    };
+    return { sun: hz(raS, decS), moon: hz(raM, decM), phi: (((lamM - lamS) % TAU) + TAU) % TAU };
+  }
+  function sunMarker(cx, cy, r) {
+    const s = ast.sun; if (s.alt < -2) return;
+    const a = Math.min(1, (s.alt + 2) / 6) * (1 - .5 * cur.gray);
+    const x = cx + Math.sin(s.az) * r * 1.43, y = cy - Math.cos(s.az) * r * 1.43;
+    ctx.save(); ctx.globalAlpha = a; ctx.shadowColor = 'rgba(255,214,120,1)'; ctx.shadowBlur = 16 * S;
+    ctx.strokeStyle = 'rgba(255,214,120,.9)'; ctx.fillStyle = 'rgb(255,226,150)'; ctx.lineWidth = 1.5 * S;
+    for (let i = 0; i < 8; i++) {
+      const b = i * Math.PI / 4;
+      ctx.beginPath(); ctx.moveTo(x + Math.cos(b) * r*.065, y + Math.sin(b) * r*.065); ctx.lineTo(x + Math.cos(b) * r*.1, y + Math.sin(b) * r*.1); ctx.stroke();
+    }
+    ctx.beginPath(); ctx.arc(x, y, r * .045, 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+  function moonMarker(cx, cy, r) {
+    const m = ast.moon; if (m.alt < 0) return;
+    const a = Math.min(1, m.alt / 6) * (1 - ast.sunVis * .8);
+    const x = cx + Math.sin(m.az) * r * 1.43, y = cy - Math.cos(m.az) * r * 1.43;
+    ctx.save(); ctx.globalAlpha = a; ctx.shadowColor = 'rgba(190,220,255,1)'; ctx.shadowBlur = 14 * S;
+    ctx.fillStyle = 'rgb(225,236,250)'; ctx.beginPath(); ctx.arc(x, y, r * .038, 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+
+  function compassGlobe(t) {
+    const cx = W/2, cy = H*.385, r = H*.15;
+    ctx.save();
+    ctx.translate(cx, cy); ctx.rotate((.008 + .01 * cur.Rn) * Math.sin(t * .7)); ctx.translate(-cx, -cy); // rocks more in rough seas
+    ctx.shadowColor = `rgba(${BRASS},.5)`; ctx.shadowBlur = 10 * S;
+    star(cx, cy, r);
+    ctx.shadowBlur = 0;
+    bezel(cx, cy, r, t);
+    sunMarker(cx, cy, r);
+    moonMarker(cx, cy, r);
+    globe(cx, cy, r, t);
+    needle(cx, cy, r, t);
+    ctx.restore();
+  }
+
+  // ---------- sea made of flowing code (roughness follows the weather) ----------
+  const layers = [
+    { y: .74, a: 14, k: .0042, s: .9,  top: [12,44,66], bot: [5,16,26], code: .55, pk: 0 },
+    { y: .80, a: 20, k: .0035, s: 1.1, top: [10,40,62], bot: [4,13,22], code: .65, pk: .6 },
+    { y: .86, a: 26, k: .0030, s: 1.3, top: [8,34,56],  bot: [4,11,19], code: .75, pk: .75 },
+    { y: .92, a: 32, k: .0026, s: 1.5, top: [7,28,48],  bot: [3,9,16],  code: .85, pk: .9 },
+    { y: .98, a: 40, k: .0022, s: 1.7, top: [5,22,40],  bot: [2,6,12],  code: 1,   pk: 1 },
+  ];
+  function sea(t) {
+    const R = cur.Rn, bright = cur.day * (1 - cur.gray);
+    const rough = Math.min(R / 1.6, 1.4);
+    layers.forEach((L, i) => {
+      const base = H * L.y, A = L.a * S * R, k = L.k / dpr * (.9 + .15 * R), step = 8 * dpr;
+      const swell = 10 * S * R * Math.sin(wph * .5 + i);
+      const crest = new Path2D(), nodes = [];
+      const yAt = x => base + swell - A * (Math.abs(Math.sin(x*k + wph*L.s + i)) * .8 + .5*Math.sin(x*k*2.3 - wph*L.s*1.3 + i*2) + .25*Math.sin(x*k*4.1 + wph*L.s*.7) + .12*cur.breeze*Math.sin(x*k*7.3 + wph*L.s*2.2));
+      let n = 0;
+      for (let x = 0; x <= W + step; x += step, n++) {
+        const y = yAt(x); x ? crest.lineTo(x, y) : crest.moveTo(x, y);
+        if (n % 7 === 0) nodes.push([x, y]);
+      }
+      const body = new Path2D(); body.addPath(crest); body.lineTo(W + step, H); body.lineTo(0, H); body.closePath();
+
+      // water: brighter in sunshine, darker in storms
+      const top = mixc(L.top, [L.top[0]+14, L.top[1]+50, L.top[2]+50], bright);
+      const bot = mixc(L.bot, [L.bot[0]+4, L.bot[1]+18, L.bot[2]+22], bright);
+      const g = ctx.createLinearGradient(0, base - A*1.5, 0, H);
+      g.addColorStop(0, rgb(top)); g.addColorStop(1, rgb(bot));
+      ctx.fillStyle = g; ctx.fill(body);
+
+      // flowing code rows (faster and brighter when rough)
+      ctx.save(); ctx.clip(body);
+      const ytop = base - A * 1.6;
+      for (let r = 0; r < 9; r++) {
+        const y = ytop + r * cell; if (y > H) break;
+        const dir = (i + r) % 2 ? 1 : -1;
+        const speed = (16 + ((r * 7 + i * 11) % 30)) * S * (.6 + .5 * R);
+        const off = (((wph * speed * dir) % W) + W) % W;
+        const st = strips[(i * 5 + r * 3) % strips.length];
+        ctx.globalAlpha = Math.max(0, (1 - r / 9)) * (.5 + .5 * Math.sin(t * 1.4 + r * 1.7 + i * 2)) * L.code * (.75 + .15 * R);
+        ctx.drawImage(st, off, y); ctx.drawImage(st, off - W, y);
+      }
+      ctx.restore();
+      ctx.globalAlpha = 1;
+
+      // glowing crest, data packets, nodes
+      ctx.save();
+      ctx.strokeStyle = `rgba(90,225,255,${.4 + L.pk * .3})`; ctx.lineWidth = (1.6 + rough) * S;
+      ctx.shadowColor = 'rgba(90,225,255,.9)'; ctx.shadowBlur = 10 * S;
+      ctx.stroke(crest);
+      if (L.pk) {
+        ctx.setLineDash([10*S, (52 - 14*rough)*S]); ctx.lineDashOffset = -wph * 70 * L.s;
+        ctx.strokeStyle = `rgba(220,250,255,${Math.min(1, L.pk * (.6 + .4 * rough))})`; ctx.lineWidth = (2 + rough) * S; ctx.stroke(crest);
+        ctx.setLineDash([]);
+        nodes.forEach((p, j) => {
+          const a = .35 + .55 * (.5 + .5 * Math.sin(t * 2 + j + i));
+          ctx.fillStyle = `rgba(190,245,255,${a * L.pk})`;
+          ctx.fillRect(p[0] - 2.5*S, p[1] - 2.5*S, 5*S, 5*S);
+        });
+      }
+      ctx.restore();
+    });
+  }
+
+  // ---------- clock + weather readout (top right) ----------
+  function updateClock() {
+    const d = now(), key = d.getHours() + ':' + d.getMinutes();
+    if (key === clockKey) return; clockKey = key;
+    clockTime = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    clockDate = d.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' });
+  }
+  function text(t) {
+    updateClock();
+    const a1 = Math.min(Math.max(t / 2, 0), 1);
+    ctx.save(); ctx.globalAlpha = a1; ctx.textAlign = 'right'; ctx.textBaseline = 'alphabetic';
+    ctx.shadowColor = 'rgba(0,30,50,.9)'; ctx.shadowBlur = 16 * S;
+    ctx.fillStyle = 'rgba(210,248,255,.97)'; ctx.font = `${56*S}px ${MONO}`;
+    ctx.fillText(clockTime, W - 48*S, 110*S);
+    ctx.fillStyle = 'rgba(160,220,238,.9)'; ctx.font = `${19*S}px ${MONO}`;
+    ctx.fillText(clockDate, W - 48*S, 140*S);
+    if (wx) {
+      const u = UNITS === 'celsius' ? '°C' : '°F';
+      ctx.fillText(`${Math.round(wx.temp)}${u}  ·  ${wx.label}`, W - 48*S, 168*S);
+      if (wx.dir != null) ctx.fillText(`Wind from ${compassName(wx.dir)}  ·  ${Math.round(wx.wind)} ${WU}`, W - 48*S, 196*S);
+    }
+    ctx.restore();
+  }
+
+  // ---------- main loop ----------
+  function frame(ms) {
+    const t = ms / 1000, dt = Math.min((ms - prev) / 1000, .1); prev = ms;
+    ast = astro(now()); ast.sunVis = smooth((ast.sun.alt + 4) / 10);
+    cur.day = smooth((ast.sun.alt + 6) / 12);                       // real daylight, with a soft dawn and dusk
+    ease(dt);
+    cur.Rn = cur.R * (1 + .3 * (1 - cur.day));                      // rougher seas after dark
+    const mph = wx ? (WU === 'km/h' ? wx.wind / 1.609 : wx.wind) : 6;
+    const bt = Math.min(1, Math.min(1, Math.max(0, mph / 25)) * .8 + .35 * (1 - cur.day));   // breeze: wind + a night breeze
+    cur.breeze += (bt - cur.breeze) * Math.min(1, dt * .7);
+    dxs = haveWind ? Math.tanh(-Math.sin(cur.wd * Math.PI / 180) * 3) : -.5;
+    cloudPh += dt * (1 + 2.5 * cur.breeze) * dxs;
+    wph += dt * (.7 + .3 * cur.Rn);
+    ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+    sky(t); lightning(t); windFx(dt); rainFx(dt);
+    compassGlobe(t);
+    if (cur.fog > .02) { ctx.fillStyle = `rgba(205,215,225,${.3 * cur.fog})`; ctx.fillRect(0, 0, W, H); }
+    sea(t);
+    text(t);
+  }
+
+  let last = 0;
+  function loop(ms) {
+    requestAnimationFrame(loop);
+    if (ms - last < 1000 / FPS - 1) return;
+    last = ms; frame(ms);
+  }
+  addEventListener('resize', build);
+  build(); loadWeather(); setInterval(loadWeather, REFRESH_MIN * 60000);
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
